@@ -26,6 +26,8 @@
 #include <list>
 #include <numeric>
 #include <regex>
+#include <thread>
+#include <chrono>
 
 #include <C2AllocatorGralloc.h>
 #include <C2PlatformSupport.h>
@@ -87,6 +89,11 @@ const static size_t kDequeueTimeoutNs = 0;
 // This value is to monitor if decoding is paused then we can signal a new empty work to HAL
 // after app resume to foreground to notify HAL something
 const static uint64_t kPipelinePausedTimeoutMs = 500;
+
+static bool areRenderMetricsEnabled() {
+    std::string v = GetServerConfigurableFlag("media_native", "render_metrics_enabled", "false");
+    return v == "true";
+}
 
 static bool areRenderMetricsEnabled() {
     std::string v = GetServerConfigurableFlag("media_native", "render_metrics_enabled", "false");
@@ -1089,6 +1096,15 @@ void CCodecBufferChannel::trackReleasedFrame(const IGraphicBufferProducer::Queue
     if (desiredRenderTimeNs < nowNs) {
         desiredRenderTimeNs = nowNs;
     }
+
+    // If the render time is more than a second from now, then pretend the frame is supposed to be
+    // rendered immediately, because that's what SurfaceFlinger heuristics will do. This is a tight
+    // coupling, but is really the only way to optimize away unnecessary present fence checks in
+    // processRenderedFrames.
+    if (desiredRenderTimeNs > nowNs + 1*1000*1000*1000LL) {
+        desiredRenderTimeNs = nowNs;
+    }
+
     // We've just queued a frame to the surface, so keep track of it and later check to see if it is
     // actually rendered.
     TrackedFrame frame;
@@ -1661,22 +1677,31 @@ status_t CCodecBufferChannel::start(
 }
 
 status_t CCodecBufferChannel::prepareInitialInputBuffers(
-        std::map<size_t, sp<MediaCodecBuffer>> *clientInputBuffers) {
+        std::map<size_t, sp<MediaCodecBuffer>> *clientInputBuffers, bool retry) {
     if (mInputSurface) {
         return OK;
     }
 
     size_t numInputSlots = mInput.lock()->numSlots;
-
-    {
-        Mutexed<Input>::Locked input(mInput);
-        while (clientInputBuffers->size() < numInputSlots) {
-            size_t index;
-            sp<MediaCodecBuffer> buffer;
-            if (!input->buffers->requestNewBuffer(&index, &buffer)) {
-                break;
+    int retryCount = 1;
+    for (; clientInputBuffers->empty() && retryCount >= 0; retryCount--) {
+        {
+            Mutexed<Input>::Locked input(mInput);
+            while (clientInputBuffers->size() < numInputSlots) {
+                size_t index;
+                sp<MediaCodecBuffer> buffer;
+                if (!input->buffers->requestNewBuffer(&index, &buffer)) {
+                    break;
+                }
+                clientInputBuffers->emplace(index, buffer);
             }
-            clientInputBuffers->emplace(index, buffer);
+        }
+        if (!retry || (retryCount <= 0)) {
+            break;
+        }
+        if (clientInputBuffers->empty()) {
+            // wait: buffer may be in transit from component.
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
         }
     }
     if (clientInputBuffers->empty()) {
@@ -2409,6 +2434,46 @@ void CCodecBufferChannel::setCrypto(const sp<ICrypto> &crypto) {
 
 void CCodecBufferChannel::setDescrambler(const sp<IDescrambler> &descrambler) {
     mDescrambler = descrambler;
+}
+
+uint32_t CCodecBufferChannel::getBuffersPixelFormat(bool isEncoder) {
+    if (isEncoder) {
+        return getInputBuffersPixelFormat();
+    } else {
+        return getOutputBuffersPixelFormat();
+    }
+}
+
+uint32_t CCodecBufferChannel::getInputBuffersPixelFormat() {
+    Mutexed<Input>::Locked input(mInput);
+    if (input->buffers == nullptr) {
+        return PIXEL_FORMAT_UNKNOWN;
+    }
+    return input->buffers->getPixelFormatIfApplicable();
+}
+
+uint32_t CCodecBufferChannel::getOutputBuffersPixelFormat() {
+    Mutexed<Output>::Locked output(mOutput);
+    if (output->buffers == nullptr) {
+        return PIXEL_FORMAT_UNKNOWN;
+    }
+    return output->buffers->getPixelFormatIfApplicable();
+}
+
+void CCodecBufferChannel::resetBuffersPixelFormat(bool isEncoder) {
+    if (isEncoder) {
+        Mutexed<Input>::Locked input(mInput);
+        if (input->buffers == nullptr) {
+            return;
+        }
+        input->buffers->resetPixelFormatIfApplicable();
+    } else {
+        Mutexed<Output>::Locked output(mOutput);
+        if (output->buffers == nullptr) {
+            return;
+        }
+        output->buffers->resetPixelFormatIfApplicable();
+    }
 }
 
 status_t toStatusT(c2_status_t c2s, c2_operation_t c2op) {

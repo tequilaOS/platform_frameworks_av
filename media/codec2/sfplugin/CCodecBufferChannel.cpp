@@ -95,11 +95,6 @@ static bool areRenderMetricsEnabled() {
     return v == "true";
 }
 
-static bool areRenderMetricsEnabled() {
-    std::string v = GetServerConfigurableFlag("media_native", "render_metrics_enabled", "false");
-    return v == "true";
-}
-
 }  // namespace
 
 CCodecBufferChannel::QueueGuard::QueueGuard(
